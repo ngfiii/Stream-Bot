@@ -7,11 +7,10 @@ const {
 } = require('discord.js');
 const { getVoiceConnection } = require('@discordjs/voice');
 const { Streamer, VideoStream, AudioStream } = require('@dank074/discord-video-stream');
-const playdl = require('play-dl');
+const ytdl = require('@distube/ytdl-core');
 const ffmpegPath = require('ffmpeg-static');
 const { spawn } = require('child_process');
  
-// ─── Client Setup ─────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -24,36 +23,37 @@ const client = new Client({
 const streamer = new Streamer(client);
 const activeStreams = new Map();
  
-// ─── Get YouTube stream URLs ──────────────────────────────────────────────────
+// ─── Get YouTube info ─────────────────────────────────────────────────────────
 async function getYtInfo(url) {
-  const info = await playdl.video_info(url);
-  const details = info.video_details;
+  const agent = ytdl.createAgent();
+  const info = await ytdl.getInfo(url, { agent });
  
-  // Get best video format (720p mp4 preferred)
-  const videoFormat = info.format
-    .filter((f) => f.mimeType?.includes('video') && f.url)
-    .sort((a, b) => {
-      const aq = parseInt(a.qualityLabel) || 0;
-      const bq = parseInt(b.qualityLabel) || 0;
-      return bq - aq;
-    })[0];
+  const videoFormat = ytdl.chooseFormat(info.formats, {
+    quality: 'highestvideo',
+    filter: (f) => f.container === 'mp4' && f.hasVideo && !f.hasAudio,
+  });
  
-  // Get best audio format
-  const audioFormat = info.format
-    .filter((f) => f.mimeType?.includes('audio') && f.url)
-    .sort((a, b) => (b.averageBitrate || 0) - (a.averageBitrate || 0))[0];
+  const audioFormat = ytdl.chooseFormat(info.formats, {
+    quality: 'highestaudio',
+    filter: 'audioonly',
+  });
+ 
+  // Fallback: combined format
+  const combinedFormat = ytdl.chooseFormat(info.formats, {
+    quality: 'highest',
+    filter: 'audioandvideo',
+  });
  
   return {
-    videoUrl: videoFormat?.url,
-    audioUrl: audioFormat?.url,
-    title: details.title,
-    duration: details.durationInSec,
-    isLive: details.upcoming === false && details.durationInSec === 0,
-    thumbnail: details.thumbnails?.[0]?.url,
+    videoUrl: videoFormat?.url || combinedFormat?.url,
+    audioUrl: audioFormat?.url || combinedFormat?.url,
+    title: info.videoDetails.title,
+    duration: parseInt(info.videoDetails.lengthSeconds),
+    isLive: info.videoDetails.isLiveContent,
   };
 }
  
-// ─── Stop active stream ───────────────────────────────────────────────────────
+// ─── Stop stream ──────────────────────────────────────────────────────────────
 function stopStream(guildId) {
   const state = activeStreams.get(guildId);
   if (state) {
@@ -75,7 +75,6 @@ async function streamToDiscord(guildId, channelId, videoUrl, audioUrl) {
   udpConn.mediaConnection.setSpeaking(true);
   udpConn.mediaConnection.setVideoStatus(true);
  
-  // Video FFmpeg process
   const ffmpegVideo = spawn(ffmpegPath, [
     '-re', '-loglevel', 'error',
     '-i', videoUrl,
@@ -85,29 +84,23 @@ async function streamToDiscord(guildId, channelId, videoUrl, audioUrl) {
     '-tune', 'zerolatency',
     '-b:v', '2500k',
     '-pix_fmt', 'yuv420p',
-    '-an',
-    '-f', 'rawvideo',
-    'pipe:1',
+    '-an', '-f', 'rawvideo', 'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
  
-  ffmpegVideo.stderr.on('data', (d) => process.stderr.write(`[FFmpeg Video] ${d}`));
+  ffmpegVideo.stderr.on('data', (d) => process.stderr.write(`[V] ${d}`));
  
   const videoStream = new VideoStream(udpConn, 30, 1000 / 30);
   ffmpegVideo.stdout.pipe(videoStream);
  
-  // Audio FFmpeg process
   const ffmpegAudio = spawn(ffmpegPath, [
     '-re', '-loglevel', 'error',
-    '-i', audioUrl || videoUrl,
+    '-i', audioUrl,
     '-c:a', 'pcm_s16le',
-    '-ar', '48000',
-    '-ac', '2',
-    '-vn',
-    '-f', 's16le',
-    'pipe:1',
+    '-ar', '48000', '-ac', '2',
+    '-vn', '-f', 's16le', 'pipe:1',
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
  
-  ffmpegAudio.stderr.on('data', (d) => process.stderr.write(`[FFmpeg Audio] ${d}`));
+  ffmpegAudio.stderr.on('data', (d) => process.stderr.write(`[A] ${d}`));
  
   const audioStream = new AudioStream(udpConn);
   ffmpegAudio.stdout.pipe(audioStream);
@@ -117,7 +110,6 @@ async function streamToDiscord(guildId, channelId, videoUrl, audioUrl) {
   return { ffmpegVideo, ffmpegAudio };
 }
  
-// ─── Format duration ──────────────────────────────────────────────────────────
 function formatDuration(seconds) {
   if (!seconds) return 'Unknown';
   const h = Math.floor(seconds / 3600);
@@ -125,8 +117,7 @@ function formatDuration(seconds) {
   const s = Math.floor(seconds % 60);
   return [h, m, s]
     .map((v, i) => (i === 0 && v === 0 ? null : String(v).padStart(2, '0')))
-    .filter(Boolean)
-    .join(':');
+    .filter(Boolean).join(':');
 }
  
 // ─── Commands ─────────────────────────────────────────────────────────────────
@@ -140,7 +131,6 @@ client.on('interactionCreate', async (interaction) => {
  
     if (!voiceChannel)
       return interaction.reply({ content: '❌ Join a voice channel first!', ephemeral: true });
- 
     if (voiceChannel.type !== ChannelType.GuildVoice)
       return interaction.reply({ content: '❌ Must be in a regular voice channel.', ephemeral: true });
  
@@ -149,14 +139,18 @@ client.on('interactionCreate', async (interaction) => {
  
     try {
       await interaction.editReply('🔍 Fetching video info...');
-      const info = await getYtInfo(url);
+ 
+      const info = await Promise.race([
+        getYtInfo(url),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Timed out fetching video info after 15s')), 15000)
+        ),
+      ]);
  
       if (!info.videoUrl)
         return interaction.editReply('❌ Could not extract a video stream from that URL.');
  
-      await interaction.editReply(
-        `▶️ Starting: **${info.title}**\n📡 Joining <#${voiceChannel.id}>...`
-      );
+      await interaction.editReply(`▶️ Starting: **${info.title}**\n📡 Joining <#${voiceChannel.id}>...`);
  
       const { ffmpegVideo, ffmpegAudio } = await streamToDiscord(
         guildId, voiceChannel.id, info.videoUrl, info.audioUrl
@@ -170,7 +164,7 @@ client.on('interactionCreate', async (interaction) => {
         `Use \`/stop\` to end.`
       );
     } catch (err) {
-      console.error('[Play Error]', err);
+      console.error('[Play Error]', err.message);
       stopStream(guildId);
       await interaction.editReply(`❌ Error: \`${err.message}\``);
     }
