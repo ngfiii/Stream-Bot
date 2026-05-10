@@ -1,10 +1,9 @@
 {
   "name": "discord-yt-stream-bot",
   "version": "1.0.0",
-  "description": "Discord bot that joins voice and streams YouTube videos/live streams via Go Live",
   "main": "bot.js",
   "scripts": {
-    "start": "node deploy.js && node bot.js"
+    "start": "node bot.js"
   },
   "dependencies": {
     "@dank074/discord-video-stream": "^3.0.0",
