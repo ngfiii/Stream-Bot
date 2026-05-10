@@ -10,9 +10,10 @@ const {
 } = require('discord.js');
 const { getVoiceConnection } = require('@discordjs/voice');
 const { Streamer, VideoStream, AudioStream } = require('@dank074/discord-video-stream');
-const ytdl = require('@distube/ytdl-core');
 const ffmpegPath = require('ffmpeg-static');
 const { spawn } = require('child_process');
+const https = require('https');
+const http = require('http');
 
 const client = new Client({
   intents: [
@@ -26,14 +27,17 @@ const client = new Client({
 const streamer = new Streamer(client);
 const activeStreams = new Map();
 
-// ─── Register slash commands on startup ───────────────────────────────────────
+// ─── Register slash commands ──────────────────────────────────────────────────
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
       .setName('play')
-      .setDescription('Stream a YouTube video or live stream in your voice channel')
+      .setDescription('Stream a YouTube video, direct URL, or upload an mp4')
       .addStringOption((o) =>
-        o.setName('url').setDescription('YouTube URL').setRequired(true)
+        o.setName('url').setDescription('YouTube or direct video/stream URL').setRequired(false)
+      )
+      .addAttachmentOption((o) =>
+        o.setName('file').setDescription('Upload an mp4 file to stream').setRequired(false)
       ),
     new SlashCommandBuilder()
       .setName('stop')
@@ -55,46 +59,64 @@ async function registerCommands() {
   }
 }
 
-// ─── Get YouTube info ─────────────────────────────────────────────────────────
-async function getYtInfo(url) {
-  const agent = ytdl.createAgent();
-  const info = await ytdl.getInfo(url, { agent });
+// ─── Check if URL is YouTube ──────────────────────────────────────────────────
+function isYouTubeUrl(url) {
+  return /youtube\.com|youtu\.be/.test(url);
+}
 
-  let videoUrl, audioUrl;
+// ─── Get info via yt-dlp ──────────────────────────────────────────────────────
+function getYtDlpInfo(url) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', [
+      '--no-playlist',
+      '-j',
+      url,
+    ]);
 
-  try {
-    const videoFormat = ytdl.chooseFormat(info.formats, {
-      quality: 'highestvideo',
-      filter: (f) => f.container === 'mp4' && f.hasVideo && !f.hasAudio,
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d));
+    proc.stderr.on('data', (d) => (stderr += d));
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr.trim() || 'yt-dlp failed'));
+      try {
+        const info = JSON.parse(stdout);
+        resolve({
+          title: info.title || 'Unknown',
+          duration: info.duration || 0,
+          isLive: info.is_live || false,
+        });
+      } catch (e) {
+        reject(new Error('Failed to parse yt-dlp output'));
+      }
     });
-    videoUrl = videoFormat?.url;
-  } catch (_) {}
+  });
+}
 
-  try {
-    const audioFormat = ytdl.chooseFormat(info.formats, {
-      quality: 'highestaudio',
-      filter: 'audioonly',
+// ─── Get direct stream URLs via yt-dlp ───────────────────────────────────────
+function getYtDlpUrls(url) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn('yt-dlp', [
+      '--no-playlist',
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+      '--get-url',
+      url,
+    ]);
+
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (d) => (stdout += d));
+    proc.stderr.on('data', (d) => (stderr += d));
+    proc.on('close', (code) => {
+      if (code !== 0) return reject(new Error(stderr.trim() || 'yt-dlp failed to get URL'));
+      const urls = stdout.trim().split('\n').filter(Boolean);
+      if (urls.length === 0) return reject(new Error('No stream URLs found'));
+      resolve({
+        videoUrl: urls[0],
+        audioUrl: urls[1] || urls[0], // fallback to same URL if combined
+      });
     });
-    audioUrl = audioFormat?.url;
-  } catch (_) {}
-
-  // Fallback to combined format
-  if (!videoUrl || !audioUrl) {
-    const combined = ytdl.chooseFormat(info.formats, {
-      quality: 'highest',
-      filter: 'audioandvideo',
-    });
-    videoUrl = videoUrl || combined?.url;
-    audioUrl = audioUrl || combined?.url;
-  }
-
-  return {
-    videoUrl,
-    audioUrl,
-    title: info.videoDetails.title,
-    duration: parseInt(info.videoDetails.lengthSeconds),
-    isLive: info.videoDetails.isLiveContent,
-  };
+  });
 }
 
 // ─── Stop stream ──────────────────────────────────────────────────────────────
@@ -171,40 +193,61 @@ client.on('interactionCreate', async (interaction) => {
 
   if (commandName === 'play') {
     const url = interaction.options.getString('url');
+    const attachment = interaction.options.getAttachment('file');
     const voiceChannel = member?.voice?.channel;
 
+    if (!url && !attachment)
+      return interaction.reply({ content: '❌ Provide a URL or upload an mp4 file.', ephemeral: true });
     if (!voiceChannel)
       return interaction.reply({ content: '❌ Join a voice channel first!', ephemeral: true });
     if (voiceChannel.type !== ChannelType.GuildVoice)
       return interaction.reply({ content: '❌ Must be in a regular voice channel.', ephemeral: true });
 
+    // Validate attachment is video
+    if (attachment && !attachment.contentType?.startsWith('video/'))
+      return interaction.reply({ content: '❌ Attachment must be a video file.', ephemeral: true });
+
     await interaction.deferReply();
     stopStream(guildId);
 
     try {
-      await interaction.editReply('🔍 Fetching video info...');
+      let videoUrl, audioUrl, title, duration, isLive;
 
-      const info = await Promise.race([
-        getYtInfo(url),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Timed out — YouTube may be blocking this server. Try again.')), 20000)
-        ),
-      ]);
+      if (attachment) {
+        // Direct Discord CDN URL — ffmpeg can read it directly
+        videoUrl = attachment.url;
+        audioUrl = attachment.url;
+        title = attachment.name || 'Uploaded file';
+        duration = 0;
+        isLive = false;
+      } else if (isYouTubeUrl(url)) {
+        await interaction.editReply('🔍 Fetching YouTube info via yt-dlp...');
+        const [info, urls] = await Promise.all([
+          getYtDlpInfo(url),
+          getYtDlpUrls(url),
+        ]);
+        ({ videoUrl, audioUrl } = urls);
+        ({ title, duration, isLive } = info);
+      } else {
+        // Direct URL (mp4, m3u8, etc.)
+        videoUrl = url;
+        audioUrl = url;
+        title = url.split('/').pop() || 'Stream';
+        duration = 0;
+        isLive = false;
+      }
 
-      if (!info.videoUrl)
-        return interaction.editReply('❌ Could not extract a video stream from that URL.');
-
-      await interaction.editReply(`▶️ Starting: **${info.title}**\n📡 Joining <#${voiceChannel.id}>...`);
+      await interaction.editReply(`▶️ Starting: **${title}**\n📡 Joining <#${voiceChannel.id}>...`);
 
       const { ffmpegVideo, ffmpegAudio } = await streamToDiscord(
-        guildId, voiceChannel.id, info.videoUrl, info.audioUrl
+        guildId, voiceChannel.id, videoUrl, audioUrl
       );
 
-      activeStreams.set(guildId, { ffmpegVideo, ffmpegAudio, title: info.title });
+      activeStreams.set(guildId, { ffmpegVideo, ffmpegAudio, title });
 
       await interaction.editReply(
-        `✅ Streaming: **${info.title}**\n` +
-        `${info.isLive ? '🔴 Live' : `⏱️ ${formatDuration(info.duration)}`}\n` +
+        `✅ Streaming: **${title}**\n` +
+        `${isLive ? '🔴 Live' : duration ? `⏱️ ${formatDuration(duration)}` : '📁 File'}\n` +
         `Use \`/stop\` to end.`
       );
     } catch (err) {
@@ -228,7 +271,7 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ─── Ready ────────────────────────────────────────────────────────────────────
-client.once('ready', async () => {
+client.once('clientReady', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
   client.user.setActivity('YouTube 📺', { type: ActivityType.Watching });
   await registerCommands();
